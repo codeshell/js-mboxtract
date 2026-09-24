@@ -5,17 +5,30 @@
  * Created by Rick Brown 2017-06-10.
  */
 import {
+	appendFile,
 	appendFileSync,
 	createWriteStream,
 	existsSync,
 	createReadStream,
 	mkdirSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
 } from "fs";
 import { MailParser } from "mailparser";
 // import { Mbox } from "node-mbox"; // v2
 import Mbox from "node-mbox";
 import path from "path";
 import sanitize from "sanitize-filename";
+import { pipeline } from "stream/promises";
+import { once } from "events";
+import { finished } from "stream/promises";
+import { randomUUID } from "crypto";
+
+const MAX_MEMORY_SIZE = 10 * 1024 * 1024;
+const LOG_INFO_FILENAME = "info.log";
+const LOG_ERROR_FILENAME = "error.log";
+const LOG_ID_GLOBAL = randomUUID().slice(0, 4);
 
 /**
  * Extracts attachments from mbox.
@@ -27,20 +40,69 @@ import sanitize from "sanitize-filename";
  */
 export function extract(config) {
 	var mbox;
+	const runState = {
+		extractionID: randomUUID().slice(0, 4),
+		summary: new Map(),
+		pendingAttachments: new Set(),
+		pendingParsers: new Set(),
+	};
+
 	if (config.outputDir) {
 		ensureDirectoryExistence(config.outputDir);
 		mbox = instantiateMbox(
 			config.outputDir,
 			!!config.dryRun,
 			!!config.subDirs,
+			runState,
 		);
 		if (!config.mboxFile) {
 			console.log("No mbox file provided. Waiting for stdin.");
 		}
+		addLineToLog(
+			config.outputDir,
+			runState,
+			"START",
+			config.mboxFile || "stdin",
+		);
 		streamMbox(mbox, config.mboxFile);
 	} else {
 		console.log("Must specify outputDir");
 	}
+}
+
+async function printSummary(outputDir, runState) {
+	while (
+		runState.pendingAttachments.size > 0 ||
+		runState.pendingParsers.size > 0
+	) {
+		await Promise.all([
+			...runState.pendingAttachments,
+			...runState.pendingParsers,
+		]);
+	}
+	console.log(runState.summary);
+	addLineToLog(
+		outputDir,
+		runState,
+		"FINISH",
+		JSON.stringify([...runState.summary]),
+	);
+}
+
+function updateSummary(runState, key, result, fileSize) {
+	let entry = runState.summary.get(key);
+	if (!entry) {
+		entry = {
+			proc: 0,
+			skip: 0,
+			fail: 0,
+			bytes: 0,
+		};
+		runState.summary.set(key, entry);
+	}
+
+	entry[result]++;
+	entry.bytes += Number(fileSize) || 0;
 }
 
 /**
@@ -50,7 +112,7 @@ export function extract(config) {
  * @param {Boolean} subDirs If true create a sub directory for each day.
  * @returns {Mbox} An instance of node-mbox.
  */
-function instantiateMbox(outputDir, dryRun, subDirs) {
+function instantiateMbox(outputDir, dryRun, subDirs, runState) {
 	var mbox = new Mbox();
 	let messageNumber = 0;
 	// Next, catch events generated:
@@ -66,6 +128,9 @@ function instantiateMbox(outputDir, dryRun, subDirs) {
 
 	mbox.on("finish", function () {
 		console.log("done reading mbox file");
+		printSummary(outputDir, runState).catch((error) => {
+			console.error("ERROR: Could not print summary", error);
+		});
 	});
 	mbox.on("message", function (msg) {
 		//"message" in node-mbox v1, is "data" on v2
@@ -74,8 +139,25 @@ function instantiateMbox(outputDir, dryRun, subDirs) {
 			streamAttachments: true,
 			checksumAlgo: "md5", // md5, sha1, sha256, sha512, ...
 		});
+		const parserCompletion = new Promise((resolve) => {
+			let completed = false;
+			const complete = () => {
+				if (!completed) {
+					completed = true;
+					resolve();
+				}
+			};
+			mailParser.once("end", complete);
+			mailParser.once("error", complete);
+		});
+		runState.pendingParsers.add(parserCompletion);
+		parserCompletion.then(
+			() => runState.pendingParsers.delete(parserCompletion),
+			() => runState.pendingParsers.delete(parserCompletion),
+		);
 		let labelDate = "";
 		let debugStepData = "";
+		let attachmentNumber = 0;
 		const messageInfo = {
 			number: messageNumber,
 			isBuffer: Buffer.isBuffer(msg),
@@ -86,7 +168,7 @@ function instantiateMbox(outputDir, dryRun, subDirs) {
 		mailParser.on("error", function (error) {
 			console.error("ERROR: Parsing message", messageInfo);
 			console.error(error);
-			const errorLog = path.join(outputDir, "error.log");
+			const errorLog = path.join(outputDir, LOG_ERROR_FILENAME);
 			const errorHeader = `\n\n--- mbox message ${messageNumber} (${messageInfo.byteLength} bytes) ---\n${error.stack || error}\n`;
 			try {
 				appendFileSync(errorLog, errorHeader);
@@ -127,28 +209,137 @@ function instantiateMbox(outputDir, dryRun, subDirs) {
 			});
 		}
 
-		mailParser.on("data", function (data) {
+		mailParser.on("data", async function (data) {
 			debugStepData = data.filename;
-			var myFile, fileToWrite;
 			if (data.type === "attachment") {
-				var fileHash = data.checksum;
-				var filename = data.filename
-					? sanitize(data.filename)
-					: fileHash;
-				fileToWrite = getUniquePath(
+				attachmentNumber++;
+				const temporaryFile = path.join(
 					outputDir,
-					labelDate,
-					filename,
-					fileHash,
+					`.mboxtract-${messageNumber}-${attachmentNumber}.tmp`,
 				);
-				if (!dryRun && fileToWrite) {
-					console.log("PROC: ", fileHash, filename, fileToWrite);
-					myFile = createWriteStream(fileToWrite);
-					data.content.pipe(myFile);
-				} else {
-					console.log("SKIP: ", fileHash, filename, fileToWrite);
-				}
-				data.release();
+				const fileExtension =
+					path.extname(data.filename || "(unnamed)") || "(none)";
+
+				const attachmentProcessing = (async () => {
+					try {
+						// Consume the stream first; mailparser sets data.checksum when it ends.
+						// await pipeline(
+						// 	data.content,
+						// 	createWriteStream(temporaryFile),
+						// );
+
+						const chunks = [];
+						let bufferedBytes = 0;
+						let temporaryStream;
+
+						for await (const chunk of data.content) {
+							if (
+								!temporaryStream &&
+								bufferedBytes + chunk.length <= MAX_MEMORY_SIZE
+							) {
+								chunks.push(chunk);
+								bufferedBytes += chunk.length;
+								continue;
+							}
+
+							if (!temporaryStream) {
+								temporaryStream =
+									createWriteStream(temporaryFile);
+
+								for (const bufferedChunk of chunks) {
+									if (!temporaryStream.write(bufferedChunk)) {
+										await once(temporaryStream, "drain");
+									}
+								}
+
+								chunks.length = 0;
+							}
+
+							if (!temporaryStream.write(chunk)) {
+								await once(temporaryStream, "drain");
+							}
+						}
+
+						let procInMemory = false;
+						if (temporaryStream) {
+							temporaryStream.end();
+							await finished(temporaryStream);
+						} else {
+							procInMemory = true;
+							// const attachmentBuffer = Buffer.concat(chunks);
+							// Use attachmentBuffer for the small-attachment path.
+						}
+
+						const fileHash = data.checksum;
+						const fileSize = data.size;
+						const filename = data.filename
+							? sanitize(data.filename)
+							: fileHash;
+						const fileToWrite = getUniquePath(
+							outputDir,
+							labelDate,
+							filename,
+							fileHash,
+						);
+
+						const key = `${labelDate}|${fileExtension}`;
+
+						if (!dryRun && fileToWrite) {
+							updateSummary(runState, key, "proc", fileSize);
+							addLineToLog(
+								outputDir,
+								runState,
+								"PROC",
+								fileHash,
+								procInMemory,
+								fileSize,
+								filename,
+								fileToWrite,
+							);
+							ensureDirectoryExistence(path.dirname(fileToWrite));
+							if (procInMemory) {
+								writeFileSync(
+									fileToWrite,
+									Buffer.concat(chunks),
+								);
+							} else {
+								renameSync(temporaryFile, fileToWrite);
+							}
+						} else {
+							updateSummary(runState, key, "skip", fileSize);
+							addLineToLog(
+								outputDir,
+								runState,
+								"SKIP",
+								fileHash,
+								procInMemory,
+								fileSize,
+								filename,
+								fileToWrite,
+							);
+							if (!procInMemory) {
+								unlinkSync(temporaryFile);
+							}
+						}
+					} catch (error) {
+						const key = `${labelDate || "0000"}|${fileExtension}`;
+						updateSummary(runState, key, "fail", data.size || 0);
+						console.error("ERROR: Attachment processing failed", {
+							message: messageNumber,
+							filename: data.filename,
+						});
+						console.error(error);
+						if (existsSync(temporaryFile))
+							unlinkSync(temporaryFile);
+					} finally {
+						data.release();
+					}
+				})();
+				runState.pendingAttachments.add(attachmentProcessing);
+				attachmentProcessing.then(
+					() => runState.pendingAttachments.delete(attachmentProcessing),
+					() => runState.pendingAttachments.delete(attachmentProcessing),
+				);
 			}
 		});
 		try {
@@ -160,6 +351,25 @@ function instantiateMbox(outputDir, dryRun, subDirs) {
 		}
 	});
 	return mbox;
+}
+
+async function addLineToLog(outputDir, runState, ...data) {
+	const infoLog = path.join(outputDir, LOG_INFO_FILENAME);
+	const marker = path.basename(path.dirname(infoLog));
+
+	const parts = [].concat(
+		new Date().toISOString(),
+		LOG_ID_GLOBAL,
+		runState.extractionID,
+		marker,
+		data,
+	);
+
+	appendFile(infoLog, parts.join(" ") + "\n", (err) => {
+		// if (err) throw err;
+		if (err) console.log(err);
+		if (err) console.log(data);
+	});
 }
 
 /**
@@ -183,28 +393,46 @@ function getUniquePath(currentDir, labelDate = "", filename, hash = "") {
 	ensureDirectoryExistence(outputDir);
 
 	let candidate = path.join(outputDir, `${base}${ext}`);
-	let counter = 1;
 
-	// variant 1: hash-only filenames
-	if (hash.length > 0 && hash == base) return candidate;
-	// variant 1b: missing filenames (fallback to hash)
-	if (hash.length > 0 && base.length == 0)
-		return path.join(outputDir, `${hash}${ext}`);
+	if (hash.length > 0) {
+		switch (true) {
+			case hash == base:
+				// variant 1: hash-only filenames
+				candidate = path.join(outputDir, `${hash}${ext}`);
+				break;
 
-	try {
-		if (existsSync(path)) {
-			// variant 2: filename + optional hash if duplicate detected
-			if (hash.length > 0)
-				return path.join(outputDir, `${base}_${hash}${ext}`);
+			case base.length == 0:
+				// variant 1b: missing filenames (fallback to hash)
+				candidate = path.join(outputDir, `${hash}${ext}`);
+				break;
+
+			default:
+				candidate = path.join(outputDir, `${base}_${hash}${ext}`);
+				break;
+		}
+
+		try {
+			if (existsSync(candidate)) {
+				// drop hashed duplicate
+				return null;
+			}
+			return candidate;
+		} catch (error) {
+			console.error(err);
+		}
+	} else {
+		let counter = 1;
+
+		try {
 			// variant 3: filename + running number for every duplicate
 			while (existsSync(candidate)) {
 				candidate = path.join(outputDir, `${base}_${counter}${ext}`);
 				counter++;
 			}
+			return candidate;
+		} catch (err) {
+			console.error(err);
 		}
-		return candidate;
-	} catch (err) {
-		console.error(err);
 	}
 
 	return null;
@@ -264,7 +492,7 @@ function streamMbox(mbox, mboxFile) {
  */
 function ensureDirectoryExistence(dirName) {
 	if (!existsSync(dirName)) {
-		mkdirSync(dirName, {recursive: true});
+		mkdirSync(dirName, { recursive: true });
 	}
 }
 
