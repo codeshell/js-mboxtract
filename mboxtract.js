@@ -9,8 +9,8 @@
  *
  * Created by Rick Brown 2017-06-10.
  */
-var extractor = require("./index"),
-	parseArgs = require("minimist");
+import { extract } from "./index.js";
+import parseArgs from "minimist";
 
 const USAGE = "mboxtract -o /path/to/output/dir [--dryrun] [--subdirs] [/path/to/file.mbox]";
 
@@ -28,7 +28,7 @@ function main() {
 			subDirs: argv.subdirs,
 			mboxFile: argv._[0]
 		};
-		extractor.extract(config);
+		extract(config);
 	} else {
 		console.log(USAGE);
 	}

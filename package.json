@@ -4,11 +4,12 @@
 	"repository": "https://github.com/ricksbrown/mboxtract.git",
 	"description": "Extracts all attachments from large MBOX files",
 	"main": "index.js",
+	"type": "module",
 	"bin": {
 		"mboxtract": "./mboxtract.js"
 	},
 	"scripts": {
-		"test": "test/test.js"
+		"test": "node test/test.js"
 	},
 	"files": [
 		"index.js",
@@ -18,8 +19,9 @@
 	"author": "ricksbrown73@gmail.com",
 	"license": "MIT",
 	"dependencies": {
-		"mailparser": "^3.7.2",
+		"mailparser": "^3.9.28",
 		"minimist": "^1.2.8",
-		"node-mbox": "1.0.0"
+		"node-mbox": "1.0.0",
+		"sanitize-filename": "^1.6.4"
 	}
 }
