@@ -29,6 +29,7 @@ const MAX_MEMORY_SIZE = 10 * 1024 * 1024;
 const LOG_INFO_FILENAME = "info.log";
 const LOG_ERROR_FILENAME = "error.log";
 const LOG_ID_GLOBAL = randomUUID().slice(0, 4);
+const NO_EXTENSION_FOLDERNAME = "_";
 
 /**
  * Extracts attachments from mbox.
@@ -45,6 +46,8 @@ export function extract(config) {
 		summary: new Map(),
 		pendingAttachments: new Set(),
 		pendingParsers: new Set(),
+		pendingLogWrite: Promise.resolve(),
+		input: "stdin",
 	};
 
 	if (config.outputDir) {
@@ -56,7 +59,9 @@ export function extract(config) {
 			runState,
 		);
 		if (!config.mboxFile) {
-			console.log("No mbox file provided. Waiting for stdin.");
+			addToConsole(runState, "No mbox file provided. Waiting for stdin.");
+		} else {
+			runState.input = path.basename(config.mboxFile);
 		}
 		addLineToLog(
 			config.outputDir,
@@ -64,10 +69,26 @@ export function extract(config) {
 			"START",
 			config.mboxFile || "stdin",
 		);
-		streamMbox(mbox, config.mboxFile);
+		streamMbox(mbox, config.mboxFile, runState);
 	} else {
-		console.log("Must specify outputDir");
+		addToConsole(runState, "Must specify outputDir");
 	}
+}
+
+function calcTotals(v, k, m) {
+	if (v && typeof v == "object" && this instanceof Map) {
+		for (const [key, value] of Object.entries(v)) {
+			this.set(key, (this.get(key) || 0) + value);
+		}
+	}
+}
+
+function addToConsole(runState, ...data) {
+	console.log(
+		"🆔 " + runState.extractionID,
+		"📧 " + runState.input + " ➡️ ",
+		...data,
+	);
 }
 
 async function printSummary(outputDir, runState) {
@@ -80,22 +101,40 @@ async function printSummary(outputDir, runState) {
 			...runState.pendingParsers,
 		]);
 	}
-	console.log(runState.summary);
-	addLineToLog(
+
+	// totals
+
+	const totals = new Map();
+	runState.summary.forEach(calcTotals, totals);
+
+	// print information
+
+	addToConsole(runState, "Totals:", totals);
+	addToConsole(runState, "Stats:", runState.summary);
+
+	await addLineToLog(
+		outputDir,
+		runState,
+		"STATS",
+		JSON.stringify([...runState.summary]),
+	);
+	await addLineToLog(
 		outputDir,
 		runState,
 		"FINISH",
-		JSON.stringify([...runState.summary]),
+		JSON.stringify(Object.fromEntries(totals)),
 	);
 }
 
-function updateSummary(runState, key, result, fileSize) {
+function updateSummary(runState, key, result, fileSize, procInMemory) {
+	key = key.toLowerCase();
 	let entry = runState.summary.get(key);
 	if (!entry) {
 		entry = {
 			proc: 0,
 			skip: 0,
 			fail: 0,
+			big: 0,
 			bytes: 0,
 		};
 		runState.summary.set(key, entry);
@@ -103,6 +142,7 @@ function updateSummary(runState, key, result, fileSize) {
 
 	entry[result]++;
 	entry.bytes += Number(fileSize) || 0;
+	if (!procInMemory) entry.big += 1;
 }
 
 /**
@@ -115,19 +155,17 @@ function updateSummary(runState, key, result, fileSize) {
 function instantiateMbox(outputDir, dryRun, subDirs, runState) {
 	var mbox = new Mbox();
 	let messageNumber = 0;
-	// Next, catch events generated:
-	// mbox.on("data", function (msg) {
-	// 	// `msg` is a `Buffer` instance
-	// 	console.log("got a message", typeof msg);
-	// 	// console.log("got a message", msg.toString().slice(0, 10));
-	// });
+
+	mbox.on("pipe", function () {
+		addToConsole(runState, "start reading mbox file");
+	});
 
 	mbox.on("error", function (err) {
-		console.log("got an error", err);
+		addToConsole(runState, "error while reading mbox file", err);
 	});
 
 	mbox.on("finish", function () {
-		console.log("done reading mbox file");
+		addToConsole(runState, "finished reading mbox file");
 		printSummary(outputDir, runState).catch((error) => {
 			console.error("ERROR: Could not print summary", error);
 		});
@@ -260,14 +298,16 @@ function instantiateMbox(outputDir, dryRun, subDirs, runState) {
 							}
 						}
 
-						let procInMemory = false;
+						let procInMemory = true;
 						if (temporaryStream) {
+							procInMemory = false;
 							temporaryStream.end();
 							await finished(temporaryStream);
 						} else {
-							procInMemory = true;
+							// For small attachments that where completely read in memory
+							// the data.checksum is calculated by MailParser without writing
+							// a temp file. This allows to run the getUniquePath() checks before writing.
 							// const attachmentBuffer = Buffer.concat(chunks);
-							// Use attachmentBuffer for the small-attachment path.
 						}
 
 						const fileHash = data.checksum;
@@ -285,7 +325,13 @@ function instantiateMbox(outputDir, dryRun, subDirs, runState) {
 						const key = `${labelDate}|${fileExtension}`;
 
 						if (!dryRun && fileToWrite) {
-							updateSummary(runState, key, "proc", fileSize);
+							updateSummary(
+								runState,
+								key,
+								"proc",
+								fileSize,
+								procInMemory,
+							);
 							addLineToLog(
 								outputDir,
 								runState,
@@ -306,7 +352,13 @@ function instantiateMbox(outputDir, dryRun, subDirs, runState) {
 								renameSync(temporaryFile, fileToWrite);
 							}
 						} else {
-							updateSummary(runState, key, "skip", fileSize);
+							updateSummary(
+								runState,
+								key,
+								"skip",
+								fileSize,
+								procInMemory,
+							);
 							addLineToLog(
 								outputDir,
 								runState,
@@ -323,7 +375,13 @@ function instantiateMbox(outputDir, dryRun, subDirs, runState) {
 						}
 					} catch (error) {
 						const key = `${labelDate || "0000"}|${fileExtension}`;
-						updateSummary(runState, key, "fail", data.size || 0);
+						updateSummary(
+							runState,
+							key,
+							"fail",
+							data.size || 0,
+							false,
+						);
 						console.error("ERROR: Attachment processing failed", {
 							message: messageNumber,
 							filename: data.filename,
@@ -337,8 +395,14 @@ function instantiateMbox(outputDir, dryRun, subDirs, runState) {
 				})();
 				runState.pendingAttachments.add(attachmentProcessing);
 				attachmentProcessing.then(
-					() => runState.pendingAttachments.delete(attachmentProcessing),
-					() => runState.pendingAttachments.delete(attachmentProcessing),
+					() =>
+						runState.pendingAttachments.delete(
+							attachmentProcessing,
+						),
+					() =>
+						runState.pendingAttachments.delete(
+							attachmentProcessing,
+						),
 				);
 			}
 		});
@@ -365,11 +429,27 @@ async function addLineToLog(outputDir, runState, ...data) {
 		data,
 	);
 
-	appendFile(infoLog, parts.join(" ") + "\n", (err) => {
-		// if (err) throw err;
-		if (err) console.log(err);
-		if (err) console.log(data);
-	});
+	const line = parts.join(" ") + "\n";
+	runState.pendingLogWrite = runState.pendingLogWrite
+		.catch(() => {})
+		.then(
+			() =>
+				new Promise((resolve, reject) => {
+					appendFile(infoLog, line, (error) => {
+						if (error) reject(error);
+						else resolve();
+					});
+				}),
+		);
+
+	// try {
+	// 	await runState.pendingLogWrite;
+	// } catch (error) {
+	// 	console.error(error);
+	// 	console.error(data);
+	// } finally {
+	// 	runState.pendingLogWrite = Promise.resolve();
+	// }
 }
 
 /**
@@ -389,7 +469,11 @@ function getUniquePath(currentDir, labelDate = "", filename, hash = "") {
 	const ext = path.extname(filepath);
 	const base = path.basename(filepath, ext);
 
-	const outputDir = path.join(dir, sanitize(ext ?? "_"), labelDate);
+	const outputDir = path.join(
+		dir,
+		sanitize(ext || "").toLowerCase() || NO_EXTENSION_FOLDERNAME,
+		labelDate,
+	);
 	ensureDirectoryExistence(outputDir);
 
 	let candidate = path.join(outputDir, `${base}${ext}`);
@@ -473,14 +557,14 @@ function pad(num) {
  * @param {Mbox} mbox An instance of node-mbox.
  * @param {String} [mboxFile] The path to the mbox file. If not provided you must pipe the mbox on stdin.
  */
-function streamMbox(mbox, mboxFile) {
+function streamMbox(mbox, mboxFile, runState) {
 	var mboxStream;
 	if (!mboxFile) {
 		mboxStream = process.stdin;
 	} else if (existsSync(mboxFile)) {
 		mboxStream = createReadStream(mboxFile);
 	} else {
-		console.log("Can't find your mbox file", mboxFile);
+		addToConsole(runState, "Can't find your mbox file", mboxFile);
 		return;
 	}
 	mboxStream.pipe(mbox);
