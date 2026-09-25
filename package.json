@@ -9,7 +9,8 @@
 		"mboxtract": "./mboxtract.js"
 	},
 	"scripts": {
-		"test": "node test/test.js"
+		"test": "node test/test.js",
+		"test-local": "node test/test.local.js"
 	},
 	"files": [
 		"index.js",

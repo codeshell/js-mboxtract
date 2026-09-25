@@ -1,6 +1,7 @@
 # Logs
 logs
 *.log
+test/downloads/*
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -72,3 +73,4 @@ ehthumbs.db
 *.njsproj
 *.sln
 *.sw?
+test/test.local.js
