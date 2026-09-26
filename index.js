@@ -30,6 +30,80 @@ const LOG_INFO_FILENAME = "info.log";
 const LOG_ERROR_FILENAME = "error.log";
 const LOG_ID_GLOBAL = randomUUID().slice(0, 4);
 const NO_EXTENSION_FOLDERNAME = "_";
+const GENERIC_EXTENSION = ".attachment";
+const ALLOWED_EXTENSIONS = [
+	"asc",
+	"avi",
+	"bmp",
+	"csv",
+	"dib",
+	"doc",
+	"docx",
+	"gif",
+	"ics",
+	"jpeg",
+	"jpg",
+	"json",
+	"mp4",
+	"odt",
+	"p7s",
+	"pdf",
+	"png",
+	"pps",
+	"ppt",
+	"pptx",
+	"tif",
+	"tiff",
+	"txt",
+	"vcf",
+	"xls",
+	"xlsm",
+	"xlsx",
+	"xltx",
+];
+const QUARANTINE_EXTENSIONS = [
+	// These always have the generic extension added (quarantine)
+	"htm",
+	"svg",
+	"zip",
+	"rar",
+	"lnk",
+	"url",
+	"js",
+	"hta",
+	"ps1",
+	"vbs",
+	"cmd",
+	"bat",
+	"exe",
+	"msi",
+];
+const FILTER_ONLY = []; // If empty, all attachments that are not forbidden will be extracted
+const FILTER_FORBIDDEN = [
+	"lnk",
+	"url",
+	"js",
+	"hta",
+	"ps1",
+	"vbs",
+	"cmd",
+	"bat",
+	"exe",
+	"msi",
+];
+const EXTRACT_MISSING_EXTENSIONS = true; // attachments without filename or without extension
+const EXTRACT_UNKNOWN_EXTENSIONS = true;
+const SANITIZE_UNKNOWN_EXTENSIONS = true; // add generic extension to files with unknown extension
+const SANITIZE_MISSING_EXTENSIONS = false; // add generic extension to files without extension
+const ALLOW_PATTERN_MIGRATION = true; // if the extension config changed, this allows to rename existing files to match it.
+const EXTENSION_GROUPS = {
+	none: null,
+	allowed: 1,
+	quarantined: 2,
+	missing: 3,
+	unknown: 4,
+	filtered: -1,
+};
 
 /**
  * Extracts attachments from mbox.
@@ -145,6 +219,59 @@ function updateSummary(runState, key, result, fileSize, procInMemory) {
 	if (!procInMemory) entry.big += 1;
 }
 
+function getExtensionGroup(extension) {
+	extension = extension.trim().toLowerCase();
+	// apply filters
+	if (FILTER_ONLY && FILTER_ONLY.length > 0) {
+		// explicit "filter only" wins over "filter forbidden", but not over group restrictions
+		// example:
+		// 		"filter only" contains "pdf", but "pdf" is unknown (not in allowed or quarantine)
+		//		if EXTRACT_UNKNOWN_EXTENSIONS is off, this filter will not overwrite it to prevent
+		//		unintended filenames. Either add pdf to a list or change the unknown settings.
+		if (!FILTER_ONLY.includes(extension.slice(1))) {
+			return EXTENSION_GROUPS.filtered;
+		}
+	} else if (
+		FILTER_FORBIDDEN &&
+		FILTER_FORBIDDEN.includes(extension.slice(1))
+	) {
+		return EXTENSION_GROUPS.filtered;
+	}
+
+	// group extensions
+
+	if (extension == NO_EXTENSION_FOLDERNAME) {
+		return EXTRACT_MISSING_EXTENSIONS
+			? EXTENSION_GROUPS.missing
+			: EXTENSION_GROUPS.filtered;
+	}
+	if (extension == ".") {
+		console.log(
+			"Script error. Dot only should not be processed as extension.",
+			extension,
+		);
+		return EXTRACT_MISSING_EXTENSIONS
+			? EXTENSION_GROUPS.missing
+			: EXTENSION_GROUPS.filtered;
+	}
+	if (extension.slice(0, 1) != ".") {
+		console.log(
+			"Script error. Invalid extension supplied for test (missing dot).",
+			extension,
+		);
+		return EXTENSION_GROUPS.filtered;
+	}
+	if (QUARANTINE_EXTENSIONS.includes(extension.slice(1))) {
+		return EXTENSION_GROUPS.quarantined;
+	}
+	if (ALLOWED_EXTENSIONS.includes(extension.slice(1))) {
+		return EXTENSION_GROUPS.allowed;
+	}
+	return EXTRACT_UNKNOWN_EXTENSIONS
+		? EXTENSION_GROUPS.unknown
+		: EXTENSION_GROUPS.filtered;
+}
+
 /**
  * Creates an instance of Mbox ready to run.
  * @param {String} outputDir The path to the output directory.
@@ -255,8 +382,30 @@ function instantiateMbox(outputDir, dryRun, subDirs, runState) {
 					outputDir,
 					`.mboxtract-${messageNumber}-${attachmentNumber}.tmp`,
 				);
+				const rawExtension = path.extname(data.filename || "");
 				const fileExtension =
-					path.extname(data.filename || "(unnamed)") || "(none)";
+					rawExtension === "."
+						? NO_EXTENSION_FOLDERNAME
+						: rawExtension || NO_EXTENSION_FOLDERNAME;
+				const fileExtensionGroup = getExtensionGroup(fileExtension);
+
+				if (fileExtensionGroup == EXTENSION_GROUPS.filtered) {
+					updateSummary(
+						runState,
+						"filter|" + fileExtension,
+						"skip",
+						0,
+						true,
+					);
+					addLineToLog(
+						outputDir,
+						runState,
+						"FILTER",
+						fileExtensionGroup,
+						data.filename,
+					);
+					return data.release();
+				}
 
 				const attachmentProcessing = (async () => {
 					try {
@@ -317,9 +466,11 @@ function instantiateMbox(outputDir, dryRun, subDirs, runState) {
 							: fileHash;
 						const fileToWrite = getUniquePath(
 							outputDir,
+							fileExtension,
 							labelDate,
 							filename,
 							fileHash,
+							fileExtensionGroup,
 						);
 
 						const key = `${labelDate}|${fileExtension}`;
@@ -442,14 +593,11 @@ async function addLineToLog(outputDir, runState, ...data) {
 				}),
 		);
 
-	// try {
-	// 	await runState.pendingLogWrite;
-	// } catch (error) {
-	// 	console.error(error);
-	// 	console.error(data);
-	// } finally {
-	// 	runState.pendingLogWrite = Promise.resolve();
-	// }
+	try {
+		await runState.pendingLogWrite;
+	} catch (error) {
+		console.error("Could not write log entry", error);
+	}
 }
 
 /**
@@ -463,57 +611,108 @@ async function addLineToLog(outputDir, runState, ...data) {
  * @param {string} hash Optional hash value of file content
  * @returns string | null
  */
-function getUniquePath(currentDir, labelDate = "", filename, hash = "") {
-	const filepath = path.join(currentDir, filename);
+function getUniquePath(
+	currentDir,
+	labelExt = "",
+	labelDate = "",
+	filename,
+	hash = "",
+	fileExtensionGroup,
+) {
+	const filepath = path.join(currentDir, sanitize(filename));
 	const dir = path.dirname(filepath);
 	const ext = path.extname(filepath);
 	const base = path.basename(filepath, ext);
 
-	const outputDir = path.join(
-		dir,
-		sanitize(ext || "").toLowerCase() || NO_EXTENSION_FOLDERNAME,
-		labelDate,
-	);
+	const outputDir = path.join(dir, sanitize(labelExt), sanitize(labelDate));
 	ensureDirectoryExistence(outputDir);
 
-	let candidate = path.join(outputDir, `${base}${ext}`);
+	// create custom extensions for files
+	// const fileExtensionGroup = getExtensionGroup(ext);
+	let customExt = "";
+	switch (fileExtensionGroup) {
+		case EXTENSION_GROUPS.quarantined:
+			customExt = GENERIC_EXTENSION;
+			break;
+		case EXTENSION_GROUPS.allowed:
+			break;
+		case EXTENSION_GROUPS.unknown:
+			if (SANITIZE_UNKNOWN_EXTENSIONS) customExt = GENERIC_EXTENSION;
+			break;
+		case EXTENSION_GROUPS.missing:
+			if (SANITIZE_MISSING_EXTENSIONS) customExt = GENERIC_EXTENSION;
+			break;
+
+		default:
+			customExt = GENERIC_EXTENSION;
+			break;
+	}
+	const newExt = ext + customExt;
+	const oldExt = customExt ? ext : ext + GENERIC_EXTENSION;
+
+	let oldCandidate = path.join(outputDir, `${base}${oldExt}`);
+	let newCandidate = path.join(outputDir, `${base}${newExt}`);
 
 	if (hash.length > 0) {
 		switch (true) {
 			case hash == base:
 				// variant 1: hash-only filenames
-				candidate = path.join(outputDir, `${hash}${ext}`);
+				oldCandidate = path.join(outputDir, `${base}${oldExt}`);
+				newCandidate = path.join(outputDir, `${base}${newExt}`);
 				break;
 
 			case base.length == 0:
 				// variant 1b: missing filenames (fallback to hash)
-				candidate = path.join(outputDir, `${hash}${ext}`);
+				oldCandidate = path.join(outputDir, `${hash}${oldExt}`);
+				newCandidate = path.join(outputDir, `${hash}${newExt}`);
 				break;
 
 			default:
-				candidate = path.join(outputDir, `${base}_${hash}${ext}`);
+				oldCandidate = path.join(outputDir, `${base}_${hash}${oldExt}`);
+				newCandidate = path.join(outputDir, `${base}_${hash}${newExt}`);
 				break;
 		}
 
 		try {
-			if (existsSync(candidate)) {
+			if (existsSync(newCandidate)) {
 				// drop hashed duplicate
 				return null;
 			}
-			return candidate;
+			if (existsSync(oldCandidate)) {
+				// drop hashed duplicate
+				if (ALLOW_PATTERN_MIGRATION) {
+					renameSync(oldCandidate, newCandidate);
+					console.log(
+						"Group",
+						fileExtensionGroup,
+						"Migrated",
+						oldCandidate,
+						"to",
+						newCandidate,
+					);
+				}
+				return null;
+			}
+			return newCandidate;
 		} catch (error) {
-			console.error(err);
+			console.error(error);
 		}
 	} else {
 		let counter = 1;
+		// there is no way to migrate anything without hashes because equal filenames tell
+		// nothing about the content. Without hashes, this script is not idempotent and will
+		// create infinite duplicates on re-runs.
 
 		try {
 			// variant 3: filename + running number for every duplicate
-			while (existsSync(candidate)) {
-				candidate = path.join(outputDir, `${base}_${counter}${ext}`);
+			while (existsSync(newCandidate)) {
+				newCandidate = path.join(
+					outputDir,
+					`${base}_${counter}${newExt}`,
+				);
 				counter++;
 			}
-			return candidate;
+			return newCandidate;
 		} catch (err) {
 			console.error(err);
 		}
